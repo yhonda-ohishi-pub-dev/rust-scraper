@@ -5,9 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorBehavior;
+use chromiumoxide::cdp::browser_protocol::page::{EventJavascriptDialogOpening, HandleJavaScriptDialogParams};
 use chromiumoxide::Page;
+use chromiumoxide::handler::HandlerMessage;
 use futures::StreamExt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::ScraperConfig;
 use crate::error::ScraperError;
@@ -38,41 +40,86 @@ impl EtcScraper {
             .ok_or_else(|| ScraperError::BrowserInit("ブラウザが初期化されていません".into()))
     }
 
-    /// ダウンロードディレクトリにCSVファイルが存在するか確認
-    fn find_csv_file(&self) -> Option<PathBuf> {
+    /// ダウンロードディレクトリの全ファイルを取得
+    fn get_existing_files(&self) -> std::collections::HashSet<PathBuf> {
         let download_dir = &self.config.download_path;
         if !download_dir.exists() {
-            return None;
+            return std::collections::HashSet::new();
         }
 
         std::fs::read_dir(download_dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.extension()
-                    .map(|ext| ext.to_ascii_lowercase() == "csv")
-                    .unwrap_or(false)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .collect()
             })
+            .unwrap_or_default()
     }
 
-    /// ダウンロード完了を待機
-    async fn wait_for_download(&self) -> Result<PathBuf, ScraperError> {
+    /// ダウンロード完了を待機（既存ファイルを除外）
+    async fn wait_for_download(
+        &self,
+        existing_files: &std::collections::HashSet<PathBuf>,
+    ) -> Result<PathBuf, ScraperError> {
         let timeout = Duration::from_secs(DOWNLOAD_WAIT_SECS);
         let poll_interval = Duration::from_millis(500);
         let start = std::time::Instant::now();
+        let download_dir = &self.config.download_path;
+
+        debug!("ダウンロード待機開始... (既存ファイル数: {})", existing_files.len());
 
         loop {
-            if let Some(path) = self.find_csv_file() {
-                // ファイルが完全にダウンロードされたか確認（.crdownloadなどがないか）
-                let filename = path.file_name().unwrap_or_default().to_string_lossy();
-                if !filename.ends_with(".crdownload") && !filename.ends_with(".tmp") {
-                    info!("CSVファイル検出: {:?}", path);
-                    return Ok(path);
+            if let Ok(entries) = std::fs::read_dir(download_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+
+                    // 既存ファイルはスキップ
+                    if existing_files.contains(&path) {
+                        continue;
+                    }
+
+                    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+
+                    // ダウンロード中のファイルはスキップ
+                    if filename.ends_with(".crdownload") || filename.ends_with(".tmp") {
+                        debug!("ダウンロード中: {}", filename);
+                        continue;
+                    }
+
+                    // CSVファイルを検出
+                    if let Some(ext) = path.extension() {
+                        if ext.to_ascii_lowercase() == "csv" {
+                            info!("CSVファイル検出: {:?}", path);
+                            return Ok(path);
+                        }
+                    }
+
+                    // 拡張子がないファイル（GUID形式）で十分なサイズがあれば完了
+                    if path.extension().is_none() {
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            if metadata.len() > 100 {
+                                // CSVにリネーム
+                                let csv_path = path.with_extension("csv");
+                                if std::fs::rename(&path, &csv_path).is_ok() {
+                                    info!("GUIDファイルをリネーム: {:?}", csv_path);
+                                    return Ok(csv_path);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             if start.elapsed() > timeout {
+                // タイムアウト時にディレクトリ内のファイルをデバッグ出力
+                let files: Vec<_> = std::fs::read_dir(download_dir)
+                    .ok()
+                    .map(|e| e.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                debug!("タイムアウト時のファイル一覧: {:?}", files);
+
                 return Err(ScraperError::Timeout(format!(
                     "ダウンロードが{}秒以内に完了しませんでした",
                     DOWNLOAD_WAIT_SECS
@@ -124,6 +171,9 @@ impl Scraper for EtcScraper {
 
         if self.config.headless {
             builder = builder.arg("--headless=new");
+        } else {
+            // headlessモードを無効化
+            builder = builder.with_head();
         }
 
         let config = builder.build().map_err(|e| {
@@ -193,22 +243,62 @@ impl Scraper for EtcScraper {
         tokio::time::sleep(Duration::from_secs(3)).await;
         debug!("ログインページに遷移完了");
 
-        // ユーザーID入力
-        page.find_element("input[name='risLoginId']")
+        // 現在のURLをデバッグ出力
+        let url: String = page
+            .evaluate("window.location.href")
             .await
-            .map_err(|e| ScraperError::ElementNotFound(format!("ユーザーID入力欄: {}", e)))?
-            .type_str(&self.config.user_id)
+            .map(|v| v.into_value().unwrap_or_default())
+            .unwrap_or_default();
+        debug!("現在のURL: {}", url);
+
+        // 入力欄が表示されるまで待機
+        for i in 0..10 {
+            let exists: bool = page
+                .evaluate(r#"document.querySelector("input[name='risLoginId']") !== null"#)
+                .await
+                .map(|v| v.into_value().unwrap_or(false))
+                .unwrap_or(false);
+            if exists {
+                debug!("ログインフォーム検出");
+                break;
+            }
+            debug!("ログインフォーム待機中... ({}/10)", i + 1);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // それでも見つからない場合、ページの内容をデバッグ出力
+        let form_exists: bool = page
+            .evaluate(r#"document.querySelector("input[name='risLoginId']") !== null"#)
             .await
-            .map_err(|e| ScraperError::Login(format!("ユーザーID入力: {}", e)))?;
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
+        if !form_exists {
+            let html: String = page
+                .evaluate("document.body.innerHTML.substring(0, 1500)")
+                .await
+                .map(|v| v.into_value().unwrap_or_default())
+                .unwrap_or_default();
+            debug!("ページHTML: {}", html);
+        }
+
+        // ユーザーID入力（JavaScriptで直接設定）
+        let user_id = &self.config.user_id;
+        page.evaluate(format!(
+            r#"document.querySelector("input[name='risLoginId']").value = '{}';"#,
+            user_id
+        ))
+        .await
+        .map_err(|e| ScraperError::Login(format!("ユーザーID入力: {}", e)))?;
         debug!("ユーザーID入力完了");
 
-        // パスワード入力
-        page.find_element("input[name='risPassword']")
-            .await
-            .map_err(|e| ScraperError::ElementNotFound(format!("パスワード入力欄: {}", e)))?
-            .type_str(&self.config.password)
-            .await
-            .map_err(|e| ScraperError::Login(format!("パスワード入力: {}", e)))?;
+        // パスワード入力（JavaScriptで直接設定）
+        let password = &self.config.password;
+        page.evaluate(format!(
+            r#"document.querySelector("input[name='risPassword']").value = '{}';"#,
+            password
+        ))
+        .await
+        .map_err(|e| ScraperError::Login(format!("パスワード入力: {}", e)))?;
         debug!("パスワード入力完了");
 
         // ログインボタンクリック
@@ -377,6 +467,9 @@ impl Scraper for EtcScraper {
             .unwrap_or_default();
         debug!("検索結果ページのリンク一覧: {}", result_links);
 
+        // 既存ファイルを記録（新しいファイルを検出するため）
+        let existing_files = self.get_existing_files();
+
         // CSVダウンロードリンクをクリック（JavaScriptで）
         let csv_clicked: bool = page
             .evaluate(
@@ -402,7 +495,7 @@ impl Scraper for EtcScraper {
         info!("CSVリンククリック: {}", csv_clicked);
 
         // ダウンロード完了を待機
-        let csv_path = self.wait_for_download().await?;
+        let csv_path = self.wait_for_download(&existing_files).await?;
 
         // ファイルをリネーム
         let renamed_path = self.rename_csv(csv_path)?;

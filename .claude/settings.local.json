@@ -3,7 +3,8 @@
     "allow": [
       "Bash(cargo check:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(ETC_USERNAME=ohishiexp ETC_PASSWORD=ohishi11 cargo run:*)"
     ]
   }
 }
