@@ -229,72 +229,177 @@ impl Scraper for EtcScraper {
         let page = self.get_page()?.clone();
         info!("CSVダウンロード処理開始...");
 
-        // JavaScriptで「検索条件の指定」リンクをクリック
-        page.evaluate(
-            r#"
-            (function() {
-                var links = document.querySelectorAll('a');
-                for (var i = 0; i < links.length; i++) {
-                    if (links[i].textContent.indexOf('検索条件の指定') >= 0) {
-                        links[i].click();
-                        return true;
+        // 現在のページ上のリンクをデバッグ出力
+        let links_debug: String = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    var texts = [];
+                    for (var i = 0; i < links.length; i++) {
+                        texts.push(links[i].textContent.trim());
                     }
-                }
-                return false;
-            })()
-            "#,
-        )
-        .await
-        .map_err(|e| ScraperError::Navigation(format!("検索条件リンククリック: {}", e)))?;
+                    return texts.join(' | ');
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or_default())
+            .unwrap_or_default();
+        debug!("ログイン後のリンク一覧: {}", links_debug);
+
+        // JavaScriptで「検索条件の指定」リンクをクリック
+        let clicked: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        if (links[i].textContent.indexOf('検索条件の指定') >= 0) {
+                            links[i].click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
+        debug!("検索条件リンククリック: {}", clicked);
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // 「全て」オプションを選択
-        if let Ok(elem) = page.find_element("input[name='sokoKbn'][value='0']").await {
-            let _ = elem.click().await;
-            debug!("「全て」オプション選択完了");
+        // 「全て」オプションを選択（JavaScriptで）
+        let _ = page
+            .evaluate(
+                r#"
+                (function() {
+                    var radio = document.querySelector("input[name='sokoKbn'][value='0']");
+                    if (radio) {
+                        radio.click();
+                        return true;
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await;
+        debug!("「全て」オプション選択完了");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // 設定保存ボタンをクリック（JavaScriptで）
+        let _ = page
+            .evaluate(
+                r#"
+                (function() {
+                    var btn = document.querySelector("input[name='focusTarget_Save']");
+                    if (btn) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await;
+        debug!("設定保存完了");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // 検索ボタンをクリック（JavaScriptで）
+        let search_clicked: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    var btn = document.querySelector("input[name='focusTarget']");
+                    if (btn) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
+
+        if !search_clicked {
+            // 検索ボタンが見つからない場合、ページのHTMLをデバッグ出力
+            let html: String = page
+                .evaluate("document.body.innerHTML.substring(0, 2000)")
+                .await
+                .map(|v| v.into_value().unwrap_or_default())
+                .unwrap_or_default();
+            debug!("ページHTML (先頭2000文字): {}", html);
+            return Err(ScraperError::ElementNotFound(
+                "検索ボタン (input[name='focusTarget']) が見つかりません".into(),
+            ));
+        }
+        debug!("検索ボタンクリック完了");
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // JavaScriptが完全に読み込まれるまで待機
+        debug!("ページスクリプトの読み込みを待機中...");
+        for i in 0..30 {
+            let ready: bool = page
+                .evaluate("(typeof goOutput === 'function' && typeof submitOpenPage === 'function')")
+                .await
+                .map(|v| v.into_value().unwrap_or(false))
+                .unwrap_or(false);
+
+            if ready {
+                debug!("スクリプト読み込み完了");
+                break;
+            }
+            debug!("スクリプト待機中... ({}/30)", i + 1);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        // 設定保存ボタンをクリック
-        if let Ok(elem) = page.find_element("input[name='focusTarget_Save']").await {
-            let _ = elem.click().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            debug!("設定保存完了");
-        }
-
-        // 検索ボタンをクリック
-        page.find_element("input[name='focusTarget']")
+        // 検索結果ページのリンク一覧をデバッグ出力
+        let result_links: String = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    var texts = [];
+                    for (var i = 0; i < links.length; i++) {
+                        texts.push(links[i].textContent.trim());
+                    }
+                    return texts.join(' | ');
+                })()
+                "#,
+            )
             .await
-            .map_err(|e| ScraperError::ElementNotFound(format!("検索ボタン: {}", e)))?
-            .click()
-            .await
-            .map_err(|e| ScraperError::Navigation(format!("検索ボタンクリック: {}", e)))?;
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        debug!("検索完了");
+            .map(|v| v.into_value().unwrap_or_default())
+            .unwrap_or_default();
+        debug!("検索結果ページのリンク一覧: {}", result_links);
 
         // CSVダウンロードリンクをクリック（JavaScriptで）
-        page.evaluate(
-            r#"
-            (function() {
-                var links = document.querySelectorAll('a');
-                for (var i = 0; i < links.length; i++) {
-                    var text = links[i].textContent;
-                    if (text.indexOf('明細') >= 0 && (text.indexOf('CSV') >= 0 || text.indexOf('ＣＳＶ') >= 0)) {
-                        console.log('Found CSV link: ' + text);
-                        links[i].click();
-                        return true;
+        let csv_clicked: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        var text = links[i].textContent;
+                        if (text.indexOf('明細') >= 0 && (text.indexOf('CSV') >= 0 || text.indexOf('ＣＳＶ') >= 0)) {
+                            console.log('Found CSV link: ' + text);
+                            links[i].click();
+                            return true;
+                        }
                     }
-                }
-                return false;
-            })()
-            "#,
-        )
-        .await
-        .map_err(|e| ScraperError::Download(format!("CSVリンククリック: {}", e)))?;
+                    return false;
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
 
-        info!("CSVダウンロード開始");
+        info!("CSVリンククリック: {}", csv_clicked);
 
         // ダウンロード完了を待機
         let csv_path = self.wait_for_download().await?;
