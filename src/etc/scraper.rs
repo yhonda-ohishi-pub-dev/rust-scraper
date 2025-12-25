@@ -7,7 +7,6 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorBehavior;
 use chromiumoxide::cdp::browser_protocol::page::{EventJavascriptDialogOpening, HandleJavaScriptDialogParams};
 use chromiumoxide::Page;
-use chromiumoxide::handler::HandlerMessage;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
@@ -161,12 +160,24 @@ impl Scraper for EtcScraper {
             .canonicalize()
             .unwrap_or_else(|_| self.config.download_path.clone());
 
+        // Windowsネイティブパスに変換（MSYS2のパスはChromeで認識されない）
+        #[cfg(windows)]
+        let download_path_str = {
+            let path_str = download_path.to_string_lossy().to_string();
+            // \\?\C:\... 形式を C:\... に変換
+            path_str.trim_start_matches(r"\\?\").to_string()
+        };
+        #[cfg(not(windows))]
+        let download_path_str = download_path.to_string_lossy().to_string();
+
+        info!("ダウンロードパス: {}", download_path_str);
+
         // ブラウザ設定
         let mut builder = BrowserConfig::builder()
             .window_size(1280, 800)
             .arg(format!(
                 "--download.default_directory={}",
-                download_path.display()
+                download_path_str
             ));
 
         if self.config.headless {
@@ -197,11 +208,32 @@ impl Scraper for EtcScraper {
             .await
             .map_err(|e| ScraperError::BrowserInit(e.to_string()))?;
 
+        // JavaScriptダイアログハンドラを設定
+        // confirmダイアログが開いたら自動的にOKをクリック
+        let mut dialog_events = page.event_listener::<EventJavascriptDialogOpening>().await
+            .map_err(|e| ScraperError::BrowserInit(format!("ダイアログリスナー設定エラー: {}", e)))?;
+
+        let page_for_dialog = page.clone();
+        tokio::spawn(async move {
+            while let Some(event) = dialog_events.next().await {
+                info!("ダイアログ検出: type={:?}, message={}", event.r#type, event.message);
+                let params = HandleJavaScriptDialogParams::builder()
+                    .accept(true)
+                    .build()
+                    .expect("HandleJavaScriptDialogParams build failed");
+                if let Err(e) = page_for_dialog.execute(params).await {
+                    warn!("ダイアログ応答エラー: {}", e);
+                } else {
+                    info!("ダイアログにOKで応答しました");
+                }
+            }
+        });
+
         // ダウンロード先を設定
         let download_params =
             chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams::builder()
                 .behavior(SetDownloadBehaviorBehavior::AllowAndName)
-                .download_path(download_path.to_string_lossy().to_string())
+                .download_path(download_path_str)
                 .events_enabled(true)
                 .build()
                 .map_err(|e| ScraperError::BrowserInit(format!("ダウンロード設定エラー: {}", e)))?;
@@ -226,21 +258,37 @@ impl Scraper for EtcScraper {
             .await
             .map_err(|e| ScraperError::Navigation(e.to_string()))?;
 
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| ScraperError::Navigation(e.to_string()))?;
+        // ページ読み込み完了を待機
+        tokio::time::sleep(Duration::from_secs(3)).await;
         debug!("トップページにアクセス完了");
 
-        // ログインリンクをクリック
+        // ログインリンクが表示されるまで待機してクリック
         let login_link_selector = format!("a[href*='{}']", LOGIN_FUNC_CODE);
-        page.find_element(&login_link_selector)
+        for i in 0..10 {
+            let exists: bool = page
+                .evaluate(format!(r#"document.querySelector("{}") !== null"#, login_link_selector))
+                .await
+                .map(|v| v.into_value().unwrap_or(false))
+                .unwrap_or(false);
+            if exists {
+                debug!("ログインリンク検出");
+                break;
+            }
+            debug!("ログインリンク待機中... ({}/10)", i + 1);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // クリックしてナビゲーションを待機
+        let element = page.find_element(&login_link_selector)
             .await
-            .map_err(|e| ScraperError::ElementNotFound(format!("ログインリンク: {}", e)))?
-            .click()
+            .map_err(|e| ScraperError::ElementNotFound(format!("ログインリンク: {}", e)))?;
+
+        element.click()
             .await
             .map_err(|e| ScraperError::Navigation(format!("ログインリンククリック: {}", e)))?;
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // ページ読み込みを待機（wait_for_navigationはタイミングが難しいので固定待機）
+        tokio::time::sleep(Duration::from_secs(5)).await;
         debug!("ログインページに遷移完了");
 
         // 現在のURLをデバッグ出力
