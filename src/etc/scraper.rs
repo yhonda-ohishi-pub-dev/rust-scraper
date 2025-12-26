@@ -18,10 +18,19 @@ const ETC_MEISAI_URL: &str = "https://www.etc-meisai.jp/";
 const LOGIN_FUNC_CODE: &str = "funccode=1013000000";
 const DOWNLOAD_WAIT_SECS: u64 = 30;
 
+/// アカウント種別
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AccountType {
+    Personal,   // 個人向け (/etc_user_meisai/)
+    Corporate,  // 法人向け (/etc_corp_meisai/)
+    Unknown,
+}
+
 pub struct EtcScraper {
     config: ScraperConfig,
     browser: Option<Browser>,
     page: Option<Arc<Page>>,
+    account_type: AccountType,
 }
 
 impl EtcScraper {
@@ -30,6 +39,7 @@ impl EtcScraper {
             config,
             browser: None,
             page: None,
+            account_type: AccountType::Unknown,
         }
     }
 
@@ -359,13 +369,36 @@ impl Scraper for EtcScraper {
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
+        // ログイン後のURLを確認してアカウント種別を判定
+        let current_url: String = page
+            .evaluate("window.location.href")
+            .await
+            .map(|v| v.into_value().unwrap_or_default())
+            .unwrap_or_default();
+        debug!("ログイン後のURL: {}", current_url);
+
+        // URL判定でアカウント種別を検出
+        // 個人: /etc_user_meisai/ を含む
+        // 法人: /etc_corp_meisai/ を含む
+        if current_url.contains("/etc_corp_meisai/") {
+            info!("法人アカウントを検出しました");
+            self.account_type = AccountType::Corporate;
+        } else if current_url.contains("/etc_user_meisai/") {
+            info!("個人アカウントを検出しました");
+            self.account_type = AccountType::Personal;
+        } else {
+            warn!("アカウント種別を判定できません: {}", current_url);
+            // デフォルトは個人として扱う
+            self.account_type = AccountType::Personal;
+        }
+
         info!("ログイン完了");
         Ok(())
     }
 
     async fn download(&mut self) -> Result<PathBuf, ScraperError> {
         let page = self.get_page()?.clone();
-        info!("CSVダウンロード処理開始...");
+        info!("CSVダウンロード処理開始... (アカウント種別: {:?})", self.account_type);
 
         // 現在のページ上のリンクをデバッグ出力
         let links_debug: String = page
@@ -385,6 +418,30 @@ impl Scraper for EtcScraper {
             .map(|v| v.into_value().unwrap_or_default())
             .unwrap_or_default();
         debug!("ログイン後のリンク一覧: {}", links_debug);
+
+        // アカウント種別によってフロー分岐
+        match self.account_type {
+            AccountType::Corporate => self.download_corporate(&page).await,
+            AccountType::Personal | AccountType::Unknown => self.download_personal(&page).await,
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), ScraperError> {
+        info!("ブラウザを終了中...");
+
+        // ページとブラウザの参照を解放
+        self.page = None;
+        self.browser = None;
+
+        info!("ブラウザ終了完了");
+        Ok(())
+    }
+}
+
+impl EtcScraper {
+    /// 個人向けダウンロード処理
+    async fn download_personal(&self, page: &Arc<Page>) -> Result<PathBuf, ScraperError> {
+        info!("個人向けダウンロード処理を開始...");
 
         // JavaScriptで「検索条件の指定」リンクをクリック
         let clicked: bool = page
@@ -464,7 +521,6 @@ impl Scraper for EtcScraper {
             .unwrap_or(false);
 
         if !search_clicked {
-            // 検索ボタンが見つからない場合、ページのHTMLをデバッグ出力
             let html: String = page
                 .evaluate("document.body.innerHTML.substring(0, 2000)")
                 .await
@@ -479,11 +535,150 @@ impl Scraper for EtcScraper {
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
+        // CSVダウンロード処理を実行
+        self.download_csv(page).await
+    }
+
+    /// 法人向けダウンロード処理
+    async fn download_corporate(&self, page: &Arc<Page>) -> Result<PathBuf, ScraperError> {
+        info!("法人向けダウンロード処理を開始...");
+
+        // 法人向けはトップページに既に明細リストがある場合がある
+        // まず現在のページにCSVリンクがあるか確認
+        let has_csv_link: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        var text = links[i].textContent;
+                        if (text.indexOf('明細') >= 0 && (text.indexOf('CSV') >= 0 || text.indexOf('ＣＳＶ') >= 0)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
+
+        if has_csv_link {
+            debug!("現在のページにCSVリンクが見つかりました");
+        } else {
+            // 検索条件ページへ移動が必要な場合
+            debug!("検索条件ページへ移動します...");
+
+            // 「検索条件の指定」または「利用明細検索」リンクをクリック
+            let clicked: bool = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        var links = document.querySelectorAll('a');
+                        for (var i = 0; i < links.length; i++) {
+                            var text = links[i].textContent;
+                            if (text.indexOf('検索条件') >= 0 || text.indexOf('利用明細検索') >= 0) {
+                                links[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                    "#,
+                )
+                .await
+                .map(|v| v.into_value().unwrap_or(false))
+                .unwrap_or(false);
+            debug!("検索リンククリック: {}", clicked);
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // 検索ボタンをクリック（法人向けは異なるセレクタの可能性）
+            let search_clicked: bool = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        // まず標準的なセレクタを試す
+                        var btn = document.querySelector("input[name='focusTarget']");
+                        if (btn) {
+                            btn.click();
+                            return true;
+                        }
+                        // 検索ボタンを探す（value属性で）
+                        var inputs = document.querySelectorAll("input[type='button'], input[type='submit']");
+                        for (var i = 0; i < inputs.length; i++) {
+                            if (inputs[i].value.indexOf('検索') >= 0) {
+                                inputs[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                    "#,
+                )
+                .await
+                .map(|v| v.into_value().unwrap_or(false))
+                .unwrap_or(false);
+
+            if !search_clicked {
+                // ページのリンク一覧をデバッグ出力
+                let links: String = page
+                    .evaluate(
+                        r#"
+                        (function() {
+                            var links = document.querySelectorAll('a');
+                            var texts = [];
+                            for (var i = 0; i < links.length; i++) {
+                                texts.push(links[i].textContent.trim());
+                            }
+                            return texts.join(' | ');
+                        })()
+                        "#,
+                    )
+                    .await
+                    .map(|v| v.into_value().unwrap_or_default())
+                    .unwrap_or_default();
+                debug!("ページのリンク一覧: {}", links);
+
+                let inputs: String = page
+                    .evaluate(
+                        r#"
+                        (function() {
+                            var inputs = document.querySelectorAll("input[type='button'], input[type='submit']");
+                            var texts = [];
+                            for (var i = 0; i < inputs.length; i++) {
+                                texts.push(inputs[i].name + '=' + inputs[i].value);
+                            }
+                            return texts.join(' | ');
+                        })()
+                        "#,
+                    )
+                    .await
+                    .map(|v| v.into_value().unwrap_or_default())
+                    .unwrap_or_default();
+                debug!("ページのボタン一覧: {}", inputs);
+
+                return Err(ScraperError::ElementNotFound(
+                    "法人向け検索ボタンが見つかりません".into(),
+                ));
+            }
+            debug!("検索ボタンクリック完了");
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        // CSVダウンロード処理を実行
+        self.download_csv(page).await
+    }
+
+    /// CSVダウンロード共通処理
+    async fn download_csv(&self, page: &Arc<Page>) -> Result<PathBuf, ScraperError> {
         // JavaScriptが完全に読み込まれるまで待機
         debug!("ページスクリプトの読み込みを待機中...");
         for i in 0..30 {
             let ready: bool = page
-                .evaluate("(typeof goOutput === 'function' && typeof submitOpenPage === 'function')")
+                .evaluate("(typeof goOutput === 'function' || typeof submitOpenPage === 'function')")
                 .await
                 .map(|v| v.into_value().unwrap_or(false))
                 .unwrap_or(false);
@@ -542,6 +737,12 @@ impl Scraper for EtcScraper {
 
         info!("CSVリンククリック: {}", csv_clicked);
 
+        if !csv_clicked {
+            return Err(ScraperError::ElementNotFound(
+                "CSVダウンロードリンクが見つかりません".into(),
+            ));
+        }
+
         // ダウンロード完了を待機
         let csv_path = self.wait_for_download(&existing_files).await?;
 
@@ -550,17 +751,6 @@ impl Scraper for EtcScraper {
 
         info!("CSVダウンロード完了: {:?}", renamed_path);
         Ok(renamed_path)
-    }
-
-    async fn close(&mut self) -> Result<(), ScraperError> {
-        info!("ブラウザを終了中...");
-
-        // ページとブラウザの参照を解放
-        self.page = None;
-        self.browser = None;
-
-        info!("ブラウザ終了完了");
-        Ok(())
     }
 }
 
