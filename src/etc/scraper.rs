@@ -16,7 +16,7 @@ use crate::traits::Scraper;
 
 const ETC_MEISAI_URL: &str = "https://www.etc-meisai.jp/";
 const LOGIN_FUNC_CODE: &str = "funccode=1013000000";
-const DOWNLOAD_WAIT_SECS: u64 = 30;
+const DOWNLOAD_WAIT_SECS: u64 = 120;
 
 /// アカウント種別
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -189,6 +189,12 @@ impl Scraper for EtcScraper {
                 "--download.default_directory={}",
                 download_path_str
             ));
+
+        // Chrome実行ファイルのパスを設定
+        if let Some(ref chrome_path) = self.config.chrome_path {
+            info!("Chrome実行ファイル: {:?}", chrome_path);
+            builder = builder.chrome_executable(chrome_path);
+        }
 
         if self.config.headless {
             builder = builder.arg("--headless=new");

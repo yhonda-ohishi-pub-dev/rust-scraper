@@ -8,6 +8,7 @@ pub struct ScraperConfig {
     pub download_path: PathBuf,
     pub headless: bool,
     pub timeout: Duration,
+    pub chrome_path: Option<PathBuf>,
 }
 
 impl Default for ScraperConfig {
@@ -18,6 +19,7 @@ impl Default for ScraperConfig {
             download_path: PathBuf::from("./downloads"),
             headless: true,
             timeout: Duration::from_secs(60),
+            chrome_path: std::env::var("CHROME_PATH").ok().map(PathBuf::from),
         }
     }
 }
