@@ -22,4 +22,7 @@ pub enum ScraperError {
 
     #[error("ファイル操作エラー: {0}")]
     FileIO(#[from] std::io::Error),
+
+    #[error("明細データなし: {0}")]
+    NoUsageData(String),
 }

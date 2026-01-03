@@ -716,6 +716,31 @@ impl EtcScraper {
             .unwrap_or_default();
         debug!("検索結果ページのリンク一覧: {}", result_links);
 
+        // 「当該月のご利用はありません」をチェック
+        let no_usage: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    var captions = document.querySelectorAll('.meisaicaption, span.meisaicaption');
+                    for (var i = 0; i < captions.length; i++) {
+                        if (captions[i].textContent.indexOf('当該月のご利用はありません') >= 0) {
+                            return true;
+                        }
+                    }
+                    // テキスト全体からも検索
+                    return document.body.innerText.indexOf('当該月のご利用はありません') >= 0;
+                })()
+                "#,
+            )
+            .await
+            .map(|v| v.into_value().unwrap_or(false))
+            .unwrap_or(false);
+
+        if no_usage {
+            info!("明細データなし（当該月のご利用はありません）- スキップします");
+            return Err(ScraperError::NoUsageData("当該月のご利用はありません".into()));
+        }
+
         // 既存ファイルを記録（新しいファイルを検出するため）
         let existing_files = self.get_existing_files();
 
