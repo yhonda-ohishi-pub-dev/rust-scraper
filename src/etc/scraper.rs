@@ -194,6 +194,8 @@ impl Scraper for EtcScraper {
         if let Some(ref chrome_path) = self.config.chrome_path {
             info!("Chrome実行ファイル: {:?}", chrome_path);
             builder = builder.chrome_executable(chrome_path);
+            // headless-shell使用時はsandbox無効化が必要
+            builder = builder.arg("--no-sandbox");
         }
 
         if self.config.headless {
