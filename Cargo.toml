@@ -35,7 +35,7 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
 
 [[example]]
@@ -45,3 +45,7 @@ path = "examples/scrape_test.rs"
 [[example]]
 name = "multi_account_test"
 path = "examples/multi_account_test.rs"
+
+[[example]]
+name = "dtakolog_test"
+path = "examples/dtakolog_test.rs"

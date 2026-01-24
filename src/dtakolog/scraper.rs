@@ -253,19 +253,37 @@ impl DtakologScraper {
         }
 
         // ログインボタンをクリック
+        info!("Clicking login button...");
         page.evaluate("document.querySelector('#imgLogin').click()")
             .await
             .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
-        sleep(Duration::from_secs(5)).await;
+        // ナビゲーション完了を待機
+        info!("Waiting for navigation after login...");
+        sleep(Duration::from_secs(8)).await;
 
-        // ログイン成功確認
-        let login_success = page
-            .evaluate("document.querySelector('#Button1st_7') !== null")
-            .await
-            .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+        // ログイン成功確認（リトライ付き）
+        let mut login_success = false;
+        for i in 0..5 {
+            match page
+                .evaluate("document.querySelector('#Button1st_7') !== null")
+                .await
+            {
+                Ok(result) => {
+                    login_success = result.into_value::<bool>().unwrap_or(false);
+                    if login_success {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!("Login check attempt {} failed: {}", i + 1, e);
+                }
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        let login_success = login_success;
 
-        if !login_success.into_value::<bool>().unwrap_or(false) {
+        if !login_success {
             // 既にログイン済みの場合
             let has_popup = page
                 .evaluate("document.querySelector('#popup_1') !== null")
@@ -367,15 +385,27 @@ impl DtakologScraper {
         }
 
         // ローディング表示の消失を待機
+        info!("Checking for loading messages...");
+        let mut loading_cleared = false;
         for i in 0..30 {
             let has_loading = page
                 .evaluate(
                     r#"
                     (() => {
-                        const waitMsg = document.querySelector('#pMsg_wait, [id*="pMsg_wait"]');
-                        if (!waitMsg) return false;
-                        const style = window.getComputedStyle(waitMsg);
-                        return style.display !== 'none' && style.visibility !== 'hidden';
+                        const waitMsg = document.querySelector('#pMsg_wait, [id*="pMsg_wait"], [id*="pMsg"], [class*="pMsg"]');
+                        const loadingDivs = document.querySelectorAll('[id*="loading"], [id*="Loading"], .loading-message, .wait-message');
+                        const allLoading = waitMsg ? [waitMsg, ...loadingDivs] : [...loadingDivs];
+
+                        const visibleLoading = allLoading.filter(elem => {
+                            if (!elem) return false;
+                            const style = window.getComputedStyle(elem);
+                            const rect = elem.getBoundingClientRect();
+                            return style.display !== 'none' &&
+                                   style.visibility !== 'hidden' &&
+                                   style.opacity !== '0' &&
+                                   (rect.width > 0 || rect.height > 0);
+                        });
+                        return visibleLoading.length > 0;
                     })()
                 "#,
                 )
@@ -383,101 +413,66 @@ impl DtakologScraper {
                 .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
             if !has_loading.into_value::<bool>().unwrap_or(false) {
+                loading_cleared = true;
+                info!("No loading messages detected, proceeding...");
                 break;
             }
 
             if i % 5 == 0 {
-                info!("Loading message visible, waiting... ({}/30)", i + 1);
+                info!("Loading message still visible, waiting... ({}/30)", i + 1);
             }
             sleep(Duration::from_secs(1)).await;
         }
 
+        if !loading_cleared {
+            warn!("Loading message timeout after 30 seconds, proceeding anyway...");
+        }
+
         sleep(Duration::from_secs(3)).await;
 
-        // JavaScriptを実行してデータを取得
-        let inject_script = format!(
-            r#"
-            window.__vehicleDataResult = null;
-            window.__vehicleDataError = null;
-            window.__vehicleDataCompleted = false;
+        // JavaScriptを実行してデータを取得（Promiseでラップ）
+        info!("Fetching vehicle data via VenusBridgeService...");
+        let start = std::time::Instant::now();
 
-            VenusBridgeService.VehicleStateTableForBranchEx('{}', '{}',
-                (data) => {{
-                    window.__vehicleDataResult = data;
-                    window.__vehicleDataCompleted = true;
-                }},
-                (error) => {{
-                    window.__vehicleDataError = error;
-                    window.__vehicleDataCompleted = true;
-                }}
-            );
+        let promise_script = format!(
+            r#"
+            new Promise((resolve, reject) => {{
+                const timeout = setTimeout(() => {{
+                    reject(new Error('Vehicle data fetch timeout after 60s'));
+                }}, 60000);
+
+                VenusBridgeService.VehicleStateTableForBranchEx('{}', '{}',
+                    (data) => {{
+                        clearTimeout(timeout);
+                        resolve(JSON.stringify(data));
+                    }},
+                    (error) => {{
+                        clearTimeout(timeout);
+                        reject(new Error(error || 'Unknown service error'));
+                    }}
+                );
+            }})
         "#,
             self.config.branch_id, self.config.filter_id
         );
 
-        page.evaluate(inject_script.as_str())
+        let result = page
+            .evaluate(promise_script.as_str())
             .await
             .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
-        // 結果をポーリング
-        info!("Waiting for vehicle data response...");
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(60);
+        let json_str = result.into_value::<String>().unwrap_or_default();
+        info!("Got vehicle data after {:?}", start.elapsed());
 
-        loop {
-            if start.elapsed() > timeout {
-                return Err(ScraperError::Timeout(format!(
-                    "Vehicle data timeout after {:?}",
-                    timeout
-                )));
-            }
+        // JSONをパース
+        let raw_data: DtakologData =
+            serde_json::from_str(&json_str).map_err(|e| ScraperError::Json(e.to_string()))?;
 
-            let completed = page
-                .evaluate("window.__vehicleDataCompleted")
-                .await
-                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+        // VehicleDataに変換
+        let vehicles = self.parse_vehicle_data(&raw_data);
+        info!("Extracted {} vehicles", vehicles.len());
 
-            if completed.into_value::<bool>().unwrap_or(false) {
-                // エラーチェック
-                let has_error = page
-                    .evaluate("window.__vehicleDataError !== null")
-                    .await
-                    .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
-
-                if has_error.into_value::<bool>().unwrap_or(false) {
-                    let error_msg = page
-                        .evaluate("window.__vehicleDataError")
-                        .await
-                        .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
-
-                    return Err(ScraperError::Extraction(format!(
-                        "Service error: {:?}",
-                        error_msg.into_value::<String>()
-                    )));
-                }
-
-                // 結果を取得
-                let result = page
-                    .evaluate("JSON.stringify(window.__vehicleDataResult)")
-                    .await
-                    .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
-
-                let json_str = result.into_value::<String>().unwrap_or_default();
-                info!("Got vehicle data after {:?}", start.elapsed());
-
-                // JSONをパース
-                let raw_data: DtakologData =
-                    serde_json::from_str(&json_str).map_err(|e| ScraperError::Json(e.to_string()))?;
-
-                // VehicleDataに変換
-                let vehicles = self.parse_vehicle_data(&raw_data);
-                info!("Extracted {} vehicles", vehicles.len());
-
-                return Ok((vehicles, raw_data));
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
+        Ok((vehicles, raw_data))
     }
 
     /// 生データをVehicleDataに変換
