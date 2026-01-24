@@ -317,7 +317,27 @@ impl DtakologScraper {
             .await
             .map_err(|e| ScraperError::Navigation(e.to_string()))?;
 
-        sleep(Duration::from_secs(5)).await;
+        // ページの完全なロードを待機
+        for i in 0..30 {
+            let ready_state = page
+                .evaluate("document.readyState")
+                .await
+                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+            let state = ready_state.into_value::<String>().unwrap_or_default();
+            if state == "complete" {
+                info!("Page load complete after {}s", i + 1);
+                break;
+            }
+
+            if i % 5 == 0 {
+                info!("Waiting for page load... ({}/30) state={}", i + 1, state);
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        // 追加の安定待機
+        sleep(Duration::from_secs(3)).await;
 
         // 現在のURLを確認
         let current_url = page
