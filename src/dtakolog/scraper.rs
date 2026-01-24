@@ -342,20 +342,33 @@ impl DtakologScraper {
         &self,
         page: &Page,
     ) -> Result<(Vec<VehicleData>, DtakologData), ScraperError> {
-        // VenusBridgeService の存在確認
-        let has_service = page
-            .evaluate(
-                r#"
-                typeof VenusBridgeService !== 'undefined' &&
-                typeof VenusBridgeService.VehicleStateTableForBranchEx === 'function'
-            "#,
-            )
-            .await
-            .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+        // VenusBridgeService のロードを待機（最大30秒）
+        let mut has_service = false;
+        for i in 0..30 {
+            let result = page
+                .evaluate(
+                    r#"
+                    typeof VenusBridgeService !== 'undefined' &&
+                    typeof VenusBridgeService.VehicleStateTableForBranchEx === 'function'
+                "#,
+                )
+                .await
+                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
-        if !has_service.into_value::<bool>().unwrap_or(false) {
+            if result.into_value::<bool>().unwrap_or(false) {
+                has_service = true;
+                break;
+            }
+
+            if i % 5 == 0 {
+                info!("Waiting for VenusBridgeService... ({}/30)", i + 1);
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        if !has_service {
             return Err(ScraperError::Extraction(
-                "VenusBridgeService not found".to_string(),
+                "VenusBridgeService not found after 30s".to_string(),
             ));
         }
 
