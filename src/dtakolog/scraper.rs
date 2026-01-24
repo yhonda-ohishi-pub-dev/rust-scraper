@@ -22,6 +22,13 @@ use super::types::{DtakologConfig, DtakologData, DtakologResult, GrpcResponse, V
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 
+/// ネットワークアイドル待機のタイムアウト（ミリ秒）
+const NETWORK_IDLE_TIMEOUT_MS: u64 = 30000;
+/// ネットワークアイドル判定のインターバル（ミリ秒）
+const NETWORK_IDLE_CHECK_INTERVAL_MS: u64 = 500;
+/// ページ安定待機のタイムアウト（ミリ秒）
+const PAGE_STABLE_TIMEOUT_MS: u64 = 10000;
+
 /// Dtakolog スクレイパー
 pub struct DtakologScraper {
     config: DtakologConfig,
@@ -258,9 +265,10 @@ impl DtakologScraper {
             .await
             .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
-        // ナビゲーション完了を待機
+        // ナビゲーション完了を待機（Go の WaitRequestIdle 相当）
         info!("Waiting for navigation after login...");
-        sleep(Duration::from_secs(8)).await;
+        self.wait_request_idle(page).await?;
+        sleep(Duration::from_secs(5)).await;
 
         // ログイン成功確認（リトライ付き）
         let mut login_success = false;
@@ -336,8 +344,11 @@ impl DtakologScraper {
             sleep(Duration::from_secs(1)).await;
         }
 
-        // 追加の安定待機
-        sleep(Duration::from_secs(3)).await;
+        // ネットワークアイドル待機（Go の WaitRequestIdle 相当）
+        self.wait_request_idle(page).await?;
+
+        // 追加の安定待機（Goと同じ5秒）
+        sleep(Duration::from_secs(5)).await;
 
         // 現在のURLを確認
         let current_url = page
@@ -397,6 +408,8 @@ impl DtakologScraper {
             self.config.branch_id, self.config.filter_id
         );
 
+        // ページ安定待機（Go の WaitStable 相当）
+        self.wait_stable(page).await?;
         sleep(Duration::from_secs(2)).await;
 
         // グリッドの出現を待機
@@ -616,6 +629,125 @@ impl DtakologScraper {
     /// ブラウザを閉じる
     pub async fn close(&mut self) -> Result<(), ScraperError> {
         self.browser = None;
+        Ok(())
+    }
+
+    /// ネットワークリクエストがアイドル状態になるまで待機（Go の WaitRequestIdle 相当）
+    async fn wait_request_idle(&self, page: &Page) -> Result<(), ScraperError> {
+        info!("Waiting for network to become idle...");
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(NETWORK_IDLE_TIMEOUT_MS);
+
+        // Performance API を使ってアクティブなリクエストを監視
+        let mut idle_count = 0;
+        const REQUIRED_IDLE_CHECKS: u32 = 3; // 連続3回アイドルでOK
+
+        while start.elapsed() < timeout {
+            let result = page
+                .evaluate(
+                    r#"
+                    (() => {
+                        // Performance API でリソースエントリを取得
+                        const entries = performance.getEntriesByType('resource');
+                        const now = performance.now();
+
+                        // 直近500ms以内に開始されたリクエストがあるか
+                        const recentRequests = entries.filter(e => {
+                            return (now - e.startTime) < 500 && e.duration === 0;
+                        });
+
+                        // XMLHttpRequest や fetch のペンディング状態も確認
+                        const hasPending = window.__pendingRequests > 0;
+
+                        return recentRequests.length === 0 && !hasPending;
+                    })()
+                "#,
+                )
+                .await;
+
+            match result {
+                Ok(val) => {
+                    if val.into_value::<bool>().unwrap_or(false) {
+                        idle_count += 1;
+                        if idle_count >= REQUIRED_IDLE_CHECKS {
+                            info!(
+                                "Network idle after {:?} ({} consecutive checks)",
+                                start.elapsed(),
+                                idle_count
+                            );
+                            return Ok(());
+                        }
+                    } else {
+                        idle_count = 0;
+                    }
+                }
+                Err(e) => {
+                    debug!("Network idle check error: {}", e);
+                    idle_count = 0;
+                }
+            }
+
+            sleep(Duration::from_millis(NETWORK_IDLE_CHECK_INTERVAL_MS)).await;
+        }
+
+        warn!(
+            "Network idle timeout after {:?}, proceeding anyway",
+            start.elapsed()
+        );
+        Ok(())
+    }
+
+    /// ページが安定するまで待機（Go の WaitStable 相当）
+    async fn wait_stable(&self, page: &Page) -> Result<(), ScraperError> {
+        info!("Waiting for page to stabilize...");
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(PAGE_STABLE_TIMEOUT_MS);
+
+        let mut last_html_len: Option<usize> = None;
+        let mut stable_count = 0;
+        const REQUIRED_STABLE_CHECKS: u32 = 3; // 連続3回同じでOK
+
+        while start.elapsed() < timeout {
+            let result = page
+                .evaluate("document.documentElement.outerHTML.length")
+                .await;
+
+            match result {
+                Ok(val) => {
+                    let current_len = val.into_value::<usize>().unwrap_or(0);
+
+                    match last_html_len {
+                        Some(last) if last == current_len => {
+                            stable_count += 1;
+                            if stable_count >= REQUIRED_STABLE_CHECKS {
+                                info!(
+                                    "Page stable after {:?} ({} consecutive checks)",
+                                    start.elapsed(),
+                                    stable_count
+                                );
+                                return Ok(());
+                            }
+                        }
+                        _ => {
+                            stable_count = 0;
+                        }
+                    }
+
+                    last_html_len = Some(current_len);
+                }
+                Err(e) => {
+                    debug!("Page stable check error: {}", e);
+                    stable_count = 0;
+                }
+            }
+
+            sleep(Duration::from_millis(300)).await;
+        }
+
+        warn!(
+            "Page stable timeout after {:?}, proceeding anyway",
+            start.elapsed()
+        );
         Ok(())
     }
 }
