@@ -41,6 +41,36 @@ pub struct DtakologResult {
     pub grpc_response: Option<GrpcResponse>,
 }
 
+/// 映像通知データ（Monitoring_DvrNotification2 の結果）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DvrNotification {
+    #[serde(rename = "VehicleCD")]
+    pub vehicle_cd: i64,
+    #[serde(rename = "VehicleName")]
+    pub vehicle_name: String,
+    #[serde(rename = "SerialNo")]
+    pub serial_no: String,
+    #[serde(rename = "FileName")]
+    pub file_name: String,
+    #[serde(rename = "FilePath")]
+    pub file_path: String,
+    #[serde(rename = "EventType")]
+    pub event_type: String,
+    #[serde(rename = "DvrDatetime")]
+    pub dvr_datetime: String,
+    #[serde(rename = "DriverName")]
+    pub driver_name: String,
+}
+
+/// DVRファイル情報（Request_DvrFileList の結果）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DvrFileInfo {
+    #[serde(rename = "FilePath")]
+    pub file_path: String,
+    #[serde(rename = "FileName")]
+    pub file_name: String,
+}
+
 /// Dtakolog スクレイプ設定
 #[derive(Debug, Clone)]
 pub struct DtakologConfig {

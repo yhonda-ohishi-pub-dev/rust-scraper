@@ -16,7 +16,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::ScraperError;
 
-use super::types::{DtakologConfig, DtakologData, DtakologResult, GrpcResponse, VehicleData};
+use super::types::{
+    DtakologConfig, DtakologData, DtakologResult, DvrFileInfo, DvrNotification, GrpcResponse,
+    VehicleData,
+};
 
 /// リトライ設定
 const MAX_RETRIES: u32 = 3;
@@ -177,6 +180,11 @@ impl DtakologScraper {
             None
         };
 
+        // 映像通知の動画処理（エラーがあってもジョブ失敗にはしない）
+        if let Err(e) = self.process_video_notifications(&page).await {
+            warn!("Video notification processing failed: {}", e);
+        }
+
         // ページを閉じる
         if let Err(e) = page.close().await {
             debug!("Failed to close page: {}", e);
@@ -291,25 +299,108 @@ impl DtakologScraper {
         }
         let login_success = login_success;
 
+        // ログイン成功時、ホームボタンをクリックしてメインページへ遷移
+        if login_success {
+            info!("Login successful, clicking home button to navigate to main page...");
+            page.evaluate("document.querySelector('#Button1st_7').click()")
+                .await
+                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+            // ナビゲーション完了を待機
+            self.wait_request_idle(page).await?;
+            sleep(Duration::from_secs(5)).await;
+        }
+
         if !login_success {
-            // 既にログイン済みの場合
+            // 既にログイン済みの場合（ポップアップが表示される）
+            info!("Button1st_7 not found, checking for popup...");
             let has_popup = page
                 .evaluate("document.querySelector('#popup_1') !== null")
                 .await
                 .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
             if has_popup.into_value::<bool>().unwrap_or(false) {
+                info!("Popup found, clicking to dismiss...");
                 page.evaluate("document.querySelector('#popup_1').click()")
                     .await
                     .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
 
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(3)).await;
+                self.wait_request_idle(page).await?;
+
+                // ポップアップ閉じた後の状態を確認
+                let current_url = page
+                    .evaluate("window.location.href")
+                    .await
+                    .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+                let url = current_url.into_value::<String>().unwrap_or_default();
+                info!("URL after popup dismiss: {}", url);
+
+                // ホームボタンを確認
+                let has_home = page
+                    .evaluate("document.querySelector('#Button1st_7') !== null")
+                    .await
+                    .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+                if has_home.into_value::<bool>().unwrap_or(false) {
+                    info!("Home button found, clicking...");
+                    page.evaluate("document.querySelector('#Button1st_7').click()")
+                        .await
+                        .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+                    self.wait_request_idle(page).await?;
+                    sleep(Duration::from_secs(3)).await;
+                } else {
+                    info!("Home button not found after popup, trying to click login button again...");
+                    // ログインボタンをもう一度クリック
+                    if let Ok(_) = page
+                        .evaluate("document.querySelector('#imgLogin').click()")
+                        .await
+                    {
+                        info!("Clicked login button again, waiting for navigation...");
+                        self.wait_request_idle(page).await?;
+                        sleep(Duration::from_secs(5)).await;
+
+                        // ログイン後にホームボタンを再確認
+                        for i in 0..5 {
+                            let has_home_retry = page
+                                .evaluate("document.querySelector('#Button1st_7') !== null")
+                                .await
+                                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+                            if has_home_retry.into_value::<bool>().unwrap_or(false) {
+                                info!("Home button found after retry (attempt {}), clicking...", i + 1);
+                                page.evaluate("document.querySelector('#Button1st_7').click()")
+                                    .await
+                                    .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+                                self.wait_request_idle(page).await?;
+                                sleep(Duration::from_secs(3)).await;
+                                break;
+                            }
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
             } else {
                 return Err(ScraperError::Login(
                     "Login verification failed".to_string(),
                 ));
             }
         }
+
+        // ログイン成功後、ページが安定するまで待機
+        info!("Login completed, waiting for page to stabilize...");
+        self.wait_request_idle(page).await?;
+        self.wait_stable(page).await?;
+
+        // ログイン後のページURLを確認（デバッグ用）
+        let current_url = page
+            .evaluate("window.location.href")
+            .await
+            .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+        info!(
+            "Post-login URL: {}",
+            current_url.into_value::<String>().unwrap_or_default()
+        );
 
         let session_id = format!("session_{}", Utc::now().timestamp());
         info!("Login successful, session ID: {}", session_id);
@@ -363,6 +454,36 @@ impl DtakologScraper {
             return Err(ScraperError::Session(
                 "Redirected to login page - session expired".to_string(),
             ));
+        }
+
+        // VenusBridgeServiceの初期化を待機（最大15秒）
+        info!("Waiting for VenusBridgeService initialization...");
+        let mut service_ready = false;
+        for i in 0..15 {
+            let has_service = page
+                .evaluate(
+                    r#"
+                    typeof VenusBridgeService !== 'undefined' &&
+                    typeof VenusBridgeService.VehicleStateTableForBranchEx === 'function'
+                "#,
+                )
+                .await
+                .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+            if has_service.into_value::<bool>().unwrap_or(false) {
+                info!("VenusBridgeService ready after {}s in navigate_to_main", i + 1);
+                service_ready = true;
+                break;
+            }
+
+            if i % 3 == 0 {
+                info!("VenusBridgeService not ready yet... ({}/15)", i + 1);
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        if !service_ready {
+            warn!("VenusBridgeService not ready after 15s in navigate_to_main, proceeding anyway...");
         }
 
         Ok(())
@@ -748,6 +869,220 @@ impl DtakologScraper {
             "Page stable timeout after {:?}, proceeding anyway",
             start.elapsed()
         );
+        Ok(())
+    }
+
+    // ========================================
+    // 映像通知（動画）処理メソッド
+    // ========================================
+
+    /// 映像通知リストを取得（Monitoring_DvrNotification2）
+    async fn get_video_notifications(
+        &self,
+        page: &Page,
+    ) -> Result<Vec<DvrNotification>, ScraperError> {
+        info!("Fetching video notifications...");
+
+        let script = r#"
+            new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new Error('Video notification fetch timeout after 30s'));
+                }, 30000);
+
+                VenusBridgeService.Monitoring_DvrNotification2(
+                    {sort: ",,0,100"},
+                    (count, jsonData) => {
+                        clearTimeout(timeout);
+                        resolve(jsonData || "[]");
+                    },
+                    (error) => {
+                        clearTimeout(timeout);
+                        reject(new Error(error || 'Unknown error'));
+                    }
+                );
+            })
+        "#;
+
+        let result = page
+            .evaluate(script)
+            .await
+            .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+        let json_str = result.into_value::<String>().unwrap_or_else(|_| "[]".to_string());
+
+        let notifications: Vec<DvrNotification> =
+            serde_json::from_str(&json_str).unwrap_or_else(|e| {
+                warn!("Failed to parse video notifications: {}", e);
+                Vec::new()
+            });
+
+        info!("Found {} video notifications", notifications.len());
+        Ok(notifications)
+    }
+
+    /// 動画ファイル一覧を取得（Request_DvrFileList）
+    async fn check_video_files(
+        &self,
+        page: &Page,
+        vehicle_cd: i64,
+    ) -> Result<Vec<DvrFileInfo>, ScraperError> {
+        let script = format!(
+            r#"
+            new Promise((resolve, reject) => {{
+                const timeout = setTimeout(() => {{
+                    reject(new Error('Video file list fetch timeout after 30s'));
+                }}, 30000);
+
+                VenusBridgeService.Request_DvrFileList(
+                    {},
+                    (a, b, jsonData, d, e) => {{
+                        clearTimeout(timeout);
+                        resolve(jsonData || "[]");
+                    }},
+                    (error) => {{
+                        clearTimeout(timeout);
+                        reject(new Error(error || 'Unknown error'));
+                    }}
+                );
+            }})
+        "#,
+            vehicle_cd
+        );
+
+        let result = page
+            .evaluate(script.as_str())
+            .await
+            .map_err(|e| ScraperError::JavaScript(e.to_string()))?;
+
+        let json_str = result.into_value::<String>().unwrap_or_else(|_| "[]".to_string());
+
+        let files: Vec<DvrFileInfo> = serde_json::from_str(&json_str).unwrap_or_else(|e| {
+            debug!("Failed to parse video file list: {}", e);
+            Vec::new()
+        });
+
+        Ok(files)
+    }
+
+    /// 動画ダウンロードをリクエスト（Request_DvrFileTransfer_MultiTarget）
+    async fn request_video_download(
+        &self,
+        page: &Page,
+        serial_no: &str,
+        file_name: &str,
+    ) -> Result<bool, ScraperError> {
+        let script = format!(
+            r#"
+            new Promise((resolve, reject) => {{
+                const timeout = setTimeout(() => {{
+                    reject(new Error('Video download request timeout after 30s'));
+                }}, 30000);
+
+                VenusBridgeService.Request_DvrFileTransfer_MultiTarget(
+                    '{}',
+                    '{}',
+                    (result) => {{
+                        clearTimeout(timeout);
+                        resolve(true);
+                    }},
+                    (error) => {{
+                        clearTimeout(timeout);
+                        reject(new Error(error || 'Unknown error'));
+                    }}
+                );
+            }})
+        "#,
+            serial_no, file_name
+        );
+
+        let result = page.evaluate(script.as_str()).await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                warn!("Video download request failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// 動画URLを構築
+    fn build_video_url(file_path: &str, file_name: &str) -> String {
+        let base_name = file_name.replace(".vdf", "");
+        format!(
+            "http://theearth-np.com/dvrData/{}/{}-1.mp4",
+            file_path, base_name
+        )
+    }
+
+    /// 映像通知の動画を処理（メインエントリ）
+    pub async fn process_video_notifications(&self, page: &Page) -> Result<(), ScraperError> {
+        info!("Processing video notifications...");
+
+        // 映像通知リストを取得
+        let notifications = self.get_video_notifications(page).await?;
+
+        if notifications.is_empty() {
+            info!("No video notifications to process");
+            return Ok(());
+        }
+
+        for notification in notifications {
+            // 通知にFilePathがあれば直接URL構築可能
+            if !notification.file_path.is_empty() {
+                let url = Self::build_video_url(&notification.file_path, &notification.file_name);
+                info!(
+                    "Video ready: vehicle={}, event={}, datetime={}, mp4={}",
+                    notification.vehicle_name,
+                    notification.event_type,
+                    notification.dvr_datetime,
+                    url
+                );
+                continue;
+            }
+
+            // FilePathが空の場合、Request_DvrFileListで確認
+            let files = self
+                .check_video_files(page, notification.vehicle_cd)
+                .await?;
+
+            // 通知のFileNameと一致するファイルを探す
+            let matching_file = files
+                .iter()
+                .find(|f| f.file_name == notification.file_name && !f.file_path.is_empty());
+
+            if let Some(file) = matching_file {
+                let url = Self::build_video_url(&file.file_path, &file.file_name);
+                info!(
+                    "Video ready: vehicle={}, event={}, datetime={}, mp4={}",
+                    notification.vehicle_name,
+                    notification.event_type,
+                    notification.dvr_datetime,
+                    url
+                );
+            } else {
+                // ダウンロードリクエスト送信
+                let success = self
+                    .request_video_download(page, &notification.serial_no, &notification.file_name)
+                    .await?;
+
+                if success {
+                    info!(
+                        "Video download requested: vehicle={}, event={}, datetime={}",
+                        notification.vehicle_name,
+                        notification.event_type,
+                        notification.dvr_datetime
+                    );
+                } else {
+                    warn!(
+                        "Video download request failed: vehicle={}, event={}",
+                        notification.vehicle_name, notification.event_type
+                    );
+                }
+            }
+        }
+
+        info!("Video notification processing completed");
         Ok(())
     }
 }
