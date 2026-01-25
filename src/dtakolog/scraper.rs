@@ -891,20 +891,37 @@ impl DtakologScraper {
         let script = r#"
             new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
-                    reject(new Error('Video notification fetch timeout after 30s'));
+                    console.warn('Video notification fetch timeout after 30s');
+                    resolve("[]");
                 }, 30000);
 
-                VenusBridgeService.Monitoring_DvrNotification2(
-                    {sort: ",,0,100"},
-                    (count, jsonData) => {
+                try {
+                    if (typeof VenusBridgeService === 'undefined' ||
+                        typeof VenusBridgeService.Monitoring_DvrNotification2 !== 'function') {
                         clearTimeout(timeout);
-                        resolve(jsonData || "[]");
-                    },
-                    (error) => {
-                        clearTimeout(timeout);
-                        reject(new Error(error || 'Unknown error'));
+                        console.warn('VenusBridgeService.Monitoring_DvrNotification2 not available');
+                        resolve("[]");
+                        return;
                     }
-                );
+
+                    VenusBridgeService.Monitoring_DvrNotification2(
+                        {sort: ",,0,100"},
+                        (count, jsonData) => {
+                            clearTimeout(timeout);
+                            resolve(jsonData || "[]");
+                        },
+                        (error) => {
+                            clearTimeout(timeout);
+                            const errorMsg = typeof error === 'object' ? JSON.stringify(error) : String(error);
+                            console.warn('Monitoring_DvrNotification2 error:', errorMsg);
+                            resolve("[]");
+                        }
+                    );
+                } catch (e) {
+                    clearTimeout(timeout);
+                    console.warn('Monitoring_DvrNotification2 exception:', e.message);
+                    resolve("[]");
+                }
             })
         "#;
 
