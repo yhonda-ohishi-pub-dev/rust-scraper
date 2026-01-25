@@ -1051,10 +1051,11 @@ impl DtakologScraper {
                 }}, 30000);
 
                 VenusBridgeService.Request_DvrFileList(
-                    {},
-                    (a, b, jsonData, d, e) => {{
+                    "{}",
+                    (result) => {{
                         clearTimeout(timeout);
-                        resolve(jsonData || "[]");
+                        // result[2] にJSONデータが含まれる
+                        resolve(result[2] || "[]");
                     }},
                     (error) => {{
                         clearTimeout(timeout);
