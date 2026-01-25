@@ -49,3 +49,7 @@ path = "examples/multi_account_test.rs"
 [[example]]
 name = "dtakolog_test"
 path = "examples/dtakolog_test.rs"
+
+[[example]]
+name = "dvr_test"
+path = "examples/dvr_test.rs"
