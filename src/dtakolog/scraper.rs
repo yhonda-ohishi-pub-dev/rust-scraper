@@ -18,7 +18,7 @@ use crate::error::ScraperError;
 
 use super::types::{
     DtakologConfig, DtakologData, DtakologResult, DvrFileInfo, DvrNotification, GrpcResponse,
-    VehicleData,
+    VehicleData, VideoNotificationResult,
 };
 
 /// リトライ設定
@@ -181,9 +181,13 @@ impl DtakologScraper {
         };
 
         // 映像通知の動画処理（エラーがあってもジョブ失敗にはしない）
-        if let Err(e) = self.process_video_notifications(&page).await {
-            warn!("Video notification processing failed: {}", e);
-        }
+        let video_notifications = match self.process_video_notifications(&page).await {
+            Ok(notifications) => notifications,
+            Err(e) => {
+                warn!("Video notification processing failed: {}", e);
+                Vec::new()
+            }
+        };
 
         // ページを閉じる
         if let Err(e) = page.close().await {
@@ -195,6 +199,7 @@ impl DtakologScraper {
             raw_data,
             session_id,
             grpc_response,
+            video_notifications,
         })
     }
 
@@ -1016,7 +1021,11 @@ impl DtakologScraper {
     }
 
     /// 映像通知の動画を処理（メインエントリ）
-    pub async fn process_video_notifications(&self, page: &Page) -> Result<(), ScraperError> {
+    /// 準備完了した動画のVideoNotificationResultリストを返す
+    pub async fn process_video_notifications(
+        &self,
+        page: &Page,
+    ) -> Result<Vec<VideoNotificationResult>, ScraperError> {
         info!("Processing video notifications...");
 
         // 映像通知リストを取得
@@ -1024,8 +1033,10 @@ impl DtakologScraper {
 
         if notifications.is_empty() {
             info!("No video notifications to process");
-            return Ok(());
+            return Ok(Vec::new());
         }
+
+        let mut results: Vec<VideoNotificationResult> = Vec::new();
 
         for notification in notifications {
             // 通知にFilePathがあれば直接URL構築可能
@@ -1038,6 +1049,16 @@ impl DtakologScraper {
                     notification.dvr_datetime,
                     url
                 );
+                results.push(VideoNotificationResult {
+                    vehicle_cd: notification.vehicle_cd,
+                    vehicle_name: notification.vehicle_name.clone(),
+                    serial_no: notification.serial_no.clone(),
+                    file_name: notification.file_name.clone(),
+                    event_type: notification.event_type.clone(),
+                    dvr_datetime: notification.dvr_datetime.clone(),
+                    driver_name: notification.driver_name.clone(),
+                    mp4_url: url,
+                });
                 continue;
             }
 
@@ -1060,6 +1081,16 @@ impl DtakologScraper {
                     notification.dvr_datetime,
                     url
                 );
+                results.push(VideoNotificationResult {
+                    vehicle_cd: notification.vehicle_cd,
+                    vehicle_name: notification.vehicle_name.clone(),
+                    serial_no: notification.serial_no.clone(),
+                    file_name: notification.file_name.clone(),
+                    event_type: notification.event_type.clone(),
+                    dvr_datetime: notification.dvr_datetime.clone(),
+                    driver_name: notification.driver_name.clone(),
+                    mp4_url: url,
+                });
             } else {
                 // ダウンロードリクエスト送信
                 let success = self
@@ -1082,7 +1113,10 @@ impl DtakologScraper {
             }
         }
 
-        info!("Video notification processing completed");
-        Ok(())
+        info!(
+            "Video notification processing completed: {} ready videos",
+            results.len()
+        );
+        Ok(results)
     }
 }

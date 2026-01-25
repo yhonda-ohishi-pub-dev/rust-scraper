@@ -39,6 +39,21 @@ pub struct DtakologResult {
     pub session_id: String,
     /// gRPC送信結果（送信した場合）
     pub grpc_response: Option<GrpcResponse>,
+    /// 映像通知結果（mp4 URL付き）
+    pub video_notifications: Vec<VideoNotificationResult>,
+}
+
+/// 映像通知結果（rust-logi送信用、mp4 URL付き）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoNotificationResult {
+    pub vehicle_cd: i64,
+    pub vehicle_name: String,
+    pub serial_no: String,
+    pub file_name: String,
+    pub event_type: String,
+    pub dvr_datetime: String,
+    pub driver_name: String,
+    pub mp4_url: String,
 }
 
 /// 映像通知データ（Monitoring_DvrNotification2 の結果）

@@ -6,4 +6,7 @@ mod scraper;
 mod types;
 
 pub use scraper::DtakologScraper;
-pub use types::{DtakologConfig, DtakologData, DtakologResult, GrpcResponse, VehicleData};
+pub use types::{
+    DtakologConfig, DtakologData, DtakologResult, GrpcResponse, VehicleData,
+    VideoNotificationResult,
+};

@@ -58,4 +58,7 @@ pub use service::{ScrapeRequest, ScrapeResult, ScraperService};
 pub use traits::Scraper;
 
 // Dtakolog 関連の型もリエクスポート
-pub use dtakolog::{DtakologConfig, DtakologData, DtakologResult, DtakologScraper, GrpcResponse, VehicleData};
+pub use dtakolog::{
+    DtakologConfig, DtakologData, DtakologResult, DtakologScraper, GrpcResponse, VehicleData,
+    VideoNotificationResult,
+};
