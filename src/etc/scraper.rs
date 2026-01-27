@@ -492,6 +492,26 @@ impl EtcScraper {
         debug!("「全て」オプション選択完了");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // 「全選択」リンクをクリック（JavaScriptで）
+        let _ = page
+            .evaluate(
+                r#"
+                (function() {
+                    var links = document.querySelectorAll('a');
+                    for (var i = 0; i < links.length; i++) {
+                        if (links[i].textContent.indexOf('全選択') >= 0) {
+                            links[i].click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+                "#,
+            )
+            .await;
+        debug!("「全選択」リンククリック完了");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
         // 設定保存ボタンをクリック（JavaScriptで）
         let _ = page
             .evaluate(
@@ -601,6 +621,62 @@ impl EtcScraper {
             debug!("検索リンククリック: {}", clicked);
 
             tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // 「全て」オプションを選択（JavaScriptで）
+            let _ = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        var radio = document.querySelector("input[name='sokoKbn'][value='0']");
+                        if (radio) {
+                            radio.click();
+                            return true;
+                        }
+                        return false;
+                    })()
+                    "#,
+                )
+                .await;
+            debug!("法人: 「全て」オプション選択完了");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // 「全選択」リンクをクリック（JavaScriptで）
+            let _ = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        var links = document.querySelectorAll('a');
+                        for (var i = 0; i < links.length; i++) {
+                            if (links[i].textContent.indexOf('全選択') >= 0) {
+                                links[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                    "#,
+                )
+                .await;
+            debug!("法人: 「全選択」リンククリック完了");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // 設定保存ボタンをクリック（JavaScriptで）
+            let _ = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        var btn = document.querySelector("input[name='focusTarget_Save']");
+                        if (btn) {
+                            btn.click();
+                            return true;
+                        }
+                        return false;
+                    })()
+                    "#,
+                )
+                .await;
+            debug!("法人: 設定保存完了");
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             // 検索ボタンをクリック（法人向けは異なるセレクタの可能性）
             let search_clicked: bool = page
